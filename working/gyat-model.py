@@ -451,76 +451,80 @@ def create_fold_indices(kfold, graphs, fold_models):
   return fold_models
 
 
+def load_process_train_validate(patience, key, graph, fold_models):
+  nodes, edges = graph.train
+  x = tensor(nodes.loc[:, "Men":])
+  y_true = tensor(nodes[["Le_y"]])
+  edge_index = long_tensor(edges[["SourceIndex", "TargetIndex"]].T)
+  edge_type = long_tensor(edges["Type"])
+  edge_attr = tensor(edges[["Direction", "Delta"]])
+
+  for fold_n, fold_model in enumerate(fold_models, 1):
+    if fold_model.patience_count > patience:
+      continue
+
+    i_fold, i_oof = fold_model.fold_indices[key]
+    i_fold = long_tensor(nodes.index[i_fold])
+    i_oof = long_tensor(nodes.index[i_oof])
+    fold_model.model.train()
+    y_pred_train = fold_model.model(i_fold, x, edge_index, edge_type, edge_attr)
+    mse_train = F.mse_loss(y_pred_train, y_true[i_fold])
+    fold_model.optimizer.zero_grad()
+    mse_train.backward()
+    fold_model.optimizer.step()
+    fold_model.fold_losses.append(mse_train.item())
+    fold_model.model.eval()
+
+    with torch.no_grad():
+      y_pred_valid = fold_model.model(i_oof, x, edge_index, edge_type, edge_attr)
+      mse_valid = F.mse_loss(y_pred_valid, y_true[i_oof])
+      fold_model.oof_losses.append(mse_valid.item())
+
+  # not needed, leaving function scope
+  # del x, y_true, edge_index, edge_type, edge_attr
+
+
 def iterate_over_epochs(n_epochs, patience, graphs, fold_models):
   for epoch_n in range(1, n_epochs + 1):
     print(f"  epoch {epoch_n}")
     epoch_start = datetime.now()
     all_folds_done = True  # default if all patience has expired
 
+    for fold_model in fold_models:
+      if fold_model.patience_count <= patience:
+        all_folds_done = False
+        fold_model.fold_losses = []
+        fold_model.oof_losses = []
+
+    for graph_n, (key, graph) in enumerate(graphs.items(), 1):
+      if graph_n < 4 or graph_n > (len(graphs) - 4):
+        print(f"{key}", sep=", ", end="", flush=True)
+      else:
+        print(".", end="", flush=True)
+
+      load_process_train_validate(patience, key, graph, fold_models)
+      torch.cuda.empty_cache()
+      gc.collect()
+
+    print()
+
     for fold_n, fold_model in enumerate(fold_models, 1):
-      print(f"    fold {fold_n}")
       if fold_model.patience_count > patience:
         continue
 
-      all_folds_done = False
-      fold_start = datetime.now()
-      fold_losses = []
-      oof_losses = []
-      print("      ", end="")
-
-      for graph_n, (key, graph) in enumerate(graphs.items(), 1):
-        if graph_n < 4 or graph_n > (len(graphs) - 4):
-          print(f"{key}", sep=", ", end="", flush=True)
-        else:
-          print(".", end="", flush=True)
-
-        nodes, edges = graph.train
-        i_fold, i_oof = fold_model.fold_indices[key]
-        i_fold = long_tensor(nodes.index[i_fold])
-        i_oof = long_tensor(nodes.index[i_oof])
-        x = tensor(nodes.loc[:, "Men":])
-        y_true = tensor(nodes[["Le_y"]])
-        edge_index = long_tensor(edges[["SourceIndex", "TargetIndex"]].T)
-        edge_type = long_tensor(edges["Type"])
-        edge_attr = tensor(edges[["Direction", "Delta"]])
-        fold_model.model.train()
-        y_pred_train = fold_model.model(i_fold, x, edge_index, edge_type, edge_attr)
-        mse_train = F.mse_loss(y_pred_train, y_true[i_fold])
-        fold_model.optimizer.zero_grad()
-        mse_train.backward()
-        fold_model.optimizer.step()
-        fold_losses.append(mse_train.item())
-        fold_model.model.eval()
-
-        with torch.no_grad():
-          y_pred_valid = fold_model.model(i_oof, x, edge_index, edge_type, edge_attr)
-          mse_valid = F.mse_loss(y_pred_valid, y_true[i_oof])
-          oof_losses.append(mse_valid.item())
-
-        del x, y_true, edge_index, edge_type, edge_attr, i_fold, i_oof
-        torch.cuda.empty_cache()
-        gc.collect()
-
-      print()
-      avg_fold_loss = sum(fold_losses) / len(fold_losses) if fold_losses else float("inf")
-      avg_oof_loss = sum(oof_losses) / len(oof_losses) if oof_losses else float("inf")
-      # print(f"      fold {fold_n}: in-fold loss={avg_fold_loss:.4f}, oof loss={avg_oof_loss:.4f}")
+      avg_fold_loss = sum(fold_model.fold_losses) / len(fold_model.fold_losses)
+      avg_oof_loss = sum(fold_model.oof_losses) / len(fold_model.oof_losses)
       is_best = fold_model.update_best(avg_oof_loss)
-
+      
       if is_best:
         torch.save(fold_model.best_state_dict, f"{state_dict_path}/fold_{fold_n}.pt")
 
-      if True or (epoch_n % (n_epochs // 100) == 0 or
-          epoch_n > (n_epochs - 3) or
-          fold_model.patience_count > patience - 5):
-        fold_time = (datetime.now() - fold_start).total_seconds()
-        print(
-          f"    epoch {epoch_n:>6}, fold {fold_n}: "
-          f"in-fold={avg_fold_loss:.4f} "
-          f"oof={avg_oof_loss:.4f} "
-          f"patience={fold_model.patience_count}/{patience} "
-          f"time={fold_time:.1f}s"
-        )
+      print(
+        f"    epoch {epoch_n:>6}, fold {fold_n}: "
+        f"in-fold={avg_fold_loss:.4f} "
+        f"oof={avg_oof_loss:.4f} "
+        f"patience={fold_model.patience_count}/{patience} "
+      )
 
       if fold_model.patience_count > patience:
         print(f"    fold {fold_n} out of patience: valid={fold_model.best_loss:.4f}")
